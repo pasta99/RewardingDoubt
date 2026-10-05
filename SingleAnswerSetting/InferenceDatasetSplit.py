@@ -4,6 +4,7 @@ import torch
 from tqdm.auto import tqdm
 import argparse
 from util.ModelLoader import load_model_tokenizer
+from util.ExactConfidence import end_of_turn
 
 from util.DataHelper import DataCollatorForTokenizedQueries, load_prepared_dataset
 from util.ResponseHandling import response_to_QAResult, save_QAResults
@@ -21,7 +22,7 @@ def inference_dataset(model_dir: str, is_unsloth_model: bool, dataset: str, spli
     # Prepare generation
     generation_kwargs_prediction = {
         "max_new_tokens": 32,
-        "eos_token_id": [tokenizer.eos_token_id,tokenizer.convert_tokens_to_ids("<|eot_id|>")],
+        "eos_token_id": [tokenizer.eos_token_id,end_of_turn(tokenizer)],
         "do_sample": True,
         "temperature": 0.6,
         "top_p": 0.9,

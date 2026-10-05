@@ -1,4 +1,5 @@
 import argparse
+import time
 import torch
 import os
 import numpy as np
@@ -19,6 +20,7 @@ from util.ResponseHandling import response_to_QAResult
 from util.RLHelper import QAResult_to_reward
 from util.util import remove_padding
 from util.ModelLoader import load_lora_model_tokenizer, load_model_tokenizer
+from util.ExactConfidence import end_of_turn, exact_confidence_step
 
 torch.manual_seed(2)
 
@@ -44,7 +46,7 @@ def evaluate_model(model, dataloader, tokenizer, generation_kwargs, device) -> T
     
     return np.mean(rewards_epoch), np.std(rewards_epoch)
 
-def train(out_dir: str, lr: float, epochs: int, batchsize: int, model_dir: str, tokenizer_dir: str, dataset: str, log_with: str = "tensorboard", is_unsloth: bool = True, use_lora: bool = True) -> None: 
+def train(out_dir: str, lr: float, epochs: int, batchsize: int, model_dir: str, tokenizer_dir: str, dataset: str, log_with: str = "tensorboard", is_unsloth: bool = True, use_lora: bool = True, objective: str = "ppo") -> None: 
     if not os.path.exists(out_dir):
         os.mkdir(out_dir)
 
@@ -99,13 +101,13 @@ def train(out_dir: str, lr: float, epochs: int, batchsize: int, model_dir: str, 
 
     prediction_terminators = [
         tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+        end_of_turn(tokenizer),
         tokenizer.convert_tokens_to_ids("ĠConfidence")
     ]
 
     ppo_terminators = [
         tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+        end_of_turn(tokenizer),
     ]
 
     generation_kwargs_prediction = {
@@ -130,7 +132,7 @@ def train(out_dir: str, lr: float, epochs: int, batchsize: int, model_dir: str, 
 
     eval_terminators = [
         tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+        end_of_turn(tokenizer),
     ]
 
     generation_kwargs_eval = {
@@ -163,6 +165,18 @@ def train(out_dir: str, lr: float, epochs: int, batchsize: int, model_dir: str, 
 
             prediction = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs_prediction)
             prediction = [remove_padding(p, tokenizer.pad_token_id) for p in prediction]
+
+            if objective in ("exact", "exact_reference"):  # score all 11 confidences exactly instead of sampling one (util/ExactConfidence.py)
+                step_start = time.time()
+                if is_unsloth:
+                    FastLanguageModel.for_training(model.pretrained_model)
+                prompt_lengths = [int(m.sum()) for m in attention_mask]
+                scored = exact_confidence_step(ppo_trainer, tokenizer, [p[len(input_ids[i]) - prompt_lengths[i]:] for i, p in enumerate(prediction)],
+                                                 prompt_lengths, questions, gt_candidates, is_multiple_choice,
+                                                 fast=objective == "exact")
+                rewards_epoch += [s["expected"] for s in scored]
+                print(f"exact step {idx}: answers scored {len(scored)}, mean expected reward {np.mean([s['expected'] for s in scored]) if scored else float('nan'):.3f}, kl coef {ppo_trainer.kl_ctl.value:.4f}, update {time.time() - step_start:.2f} s, wall {time.time():.1f}", flush=True)
+                continue
 
             # Generate confidence
             if not is_unsloth:
@@ -234,6 +248,9 @@ def setup_parser():
     parser.add_argument("--log_with", type=str, default="tensorboard")
     parser.add_argument("--dataset", type=str, default="medqa")
     parser.add_argument("--is_unsloth", action='store_true')
+    parser.add_argument("--objective", choices=["ppo", "exact", "exact_reference"], default="ppo",
+                        help="exact: expected confidence reward computed exactly instead of the PPO step (util/ExactConfidence.py); "
+                             "exact_reference: the same objective scoring the 11 completions one by one, for checking")
 
     return parser
 
@@ -241,4 +258,4 @@ def setup_parser():
 if __name__ == "__main__":
     parser = setup_parser()
     args = parser.parse_args()
-    train(args.out_dir, lr=args.lr, epochs=args.epochs, batchsize=args.batchsize, model_dir=args.model_dir, tokenizer_dir=args.tokenizer_dir, dataset=args.dataset, log_with=args.log_with, is_unsloth=args.is_unsloth)
+    train(args.out_dir, lr=args.lr, epochs=args.epochs, batchsize=args.batchsize, model_dir=args.model_dir, tokenizer_dir=args.tokenizer_dir, dataset=args.dataset, log_with=args.log_with, is_unsloth=args.is_unsloth, objective=args.objective)
